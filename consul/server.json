@@ -1,0 +1,12 @@
+{
+  "server": true,
+  "bootstrap_expect": 1,
+  "datacenter": "dc1",
+  "data_dir": "/opt/consul/data",
+  "log_level": "INFO",
+  "bind_addr": "192.168.100.11",
+  "client_addr": "0.0.0.0",
+  "ui_config": {
+    "enabled": true
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "service": {
+    "name": "web",
+    "port": 3000,
+    "check": {
+      "http": "http://localhost:3000/health",
+      "interval": "5s",
+      "timeout": "3s",
+      "deregistercriticalserviceafter": "1m"
+    }
+  }
+}

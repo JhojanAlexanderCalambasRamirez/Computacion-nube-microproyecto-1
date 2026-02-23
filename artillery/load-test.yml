@@ -1,0 +1,27 @@
+config:
+  target: "http://localhost:8080"
+  phases:
+    - name: "Calentamiento"
+      duration: 30
+      arrivalRate: 5
+    - name: "Carga normal"
+      duration: 60
+      arrivalRate: 20
+    - name: "Carga alta"
+      duration: 60
+      arrivalRate: 50
+    - name: "Pico de trafico"
+      duration: 30
+      arrivalRate: 100
+
+scenarios:
+  - name: "Peticion raiz"
+    weight: 80
+    requests:
+      - get:
+          url: "/"
+  - name: "Health check"
+    weight: 20
+    requests:
+      - get:
+          url: "/health"

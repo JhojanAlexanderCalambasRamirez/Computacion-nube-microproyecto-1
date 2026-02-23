@@ -1,0 +1,9 @@
+{
+  "server": false,
+  "datacenter": "dc1",
+  "data_dir": "/opt/consul/data",
+  "log_level": "INFO",
+  "bind_addr": "192.168.100.12",
+  "client_addr": "0.0.0.0",
+  "retry_join": ["192.168.100.11"]
+}

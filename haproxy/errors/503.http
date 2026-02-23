@@ -1,0 +1,28 @@
+HTTP/1.0 503 Service Unavailable
+Cache-Control: no-cache
+Connection: close
+Content-Type: text/html; charset=utf-8
+
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <title>Servicio No Disponible</title>
+  <style>
+    body { font-family: Arial, sans-serif; text-align: center; padding: 60px; background: #fff5f5; }
+    .card { background: white; border-radius: 12px; padding: 40px; max-width: 500px;
+            margin: 0 auto; box-shadow: 0 4px 16px rgba(0,0,0,0.12); }
+    h1 { color: #e53e3e; }
+    p  { color: #718096; }
+    .code { font-size: 64px; font-weight: bold; color: #fc8181; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <p class="code">503</p>
+    <h1>Servicio No Disponible</h1>
+    <p>Lo sentimos, todos los servidores están temporalmente fuera de servicio.</p>
+    <p>Por favor, intente nuevamente en unos momentos.</p>
+  </div>
+</body>
+</html>
