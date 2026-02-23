@@ -17,11 +17,11 @@ config:
 scenarios:
   - name: "Peticion raiz"
     weight: 80
-    requests:
+    flow:
       - get:
           url: "/"
   - name: "Health check"
     weight: 20
-    requests:
+    flow:
       - get:
           url: "/health"

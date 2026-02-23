@@ -22,7 +22,9 @@ apt-get install -y -q nodejs
 
 # ── 3. Instalar Consul (binario) ──────────────────
 echo ">>> [3/6] Instalando Consul ${CONSUL_VERSION}..."
-wget -q "https://releases.hashicorp.com/consul/${CONSUL_VERSION}/consul_${CONSUL_VERSION}_linux_amd64.zip" \
+ARCH=$(dpkg --print-architecture)   # detecta: amd64 o arm64
+echo "    Arquitectura detectada: ${ARCH}"
+wget -q "https://releases.hashicorp.com/consul/${CONSUL_VERSION}/consul_${CONSUL_VERSION}_linux_${ARCH}.zip" \
      -O /tmp/consul.zip
 unzip -q /tmp/consul.zip -d /tmp/consul_bin
 mv /tmp/consul_bin/consul /usr/local/bin/consul
@@ -62,11 +64,10 @@ cat > /etc/systemd/system/consul.service <<'EOF'
 [Unit]
 Description=HashiCorp Consul - Service Mesh
 Documentation=https://www.consul.io/
-After=network-online.target
-Wants=network-online.target
+After=network.target
 
 [Service]
-Type=notify
+Type=simple
 User=root
 ExecStart=/usr/local/bin/consul agent -config-dir=/etc/consul.d
 ExecReload=/bin/kill -HUP $MAINPID
