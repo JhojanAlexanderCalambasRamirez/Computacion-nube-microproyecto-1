@@ -80,10 +80,10 @@ LimitNOFILE=65536
 WantedBy=multi-user.target
 EOF
 
-# ── NodeJS service ──
-cat > /etc/systemd/system/nodeapp.service <<'EOF'
+# ── NodeJS replica 1 (puerto 3000) ──
+cat > /etc/systemd/system/nodeapp-3000.service <<'EOF'
 [Unit]
-Description=NodeJS Web Server - Microproyecto 1
+Description=NodeJS Web Server - Replica 3000
 After=network.target consul.service
 Wants=consul.service
 
@@ -91,12 +91,36 @@ Wants=consul.service
 Type=simple
 User=root
 WorkingDirectory=/opt/app
+Environment=PORT=3000
 ExecStart=/usr/bin/node server.js
 Restart=always
 RestartSec=5
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=nodeapp
+SyslogIdentifier=nodeapp-3000
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# ── NodeJS replica 2 (puerto 3001) ──
+cat > /etc/systemd/system/nodeapp-3001.service <<'EOF'
+[Unit]
+Description=NodeJS Web Server - Replica 3001
+After=network.target consul.service
+Wants=consul.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/app
+Environment=PORT=3001
+ExecStart=/usr/bin/node server.js
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nodeapp-3001
 
 [Install]
 WantedBy=multi-user.target
@@ -111,13 +135,16 @@ systemctl start consul
 echo "    Esperando que Consul estabilice..."
 sleep 6
 
-systemctl enable nodeapp
-systemctl start nodeapp
+systemctl enable nodeapp-3000
+systemctl start nodeapp-3000
+
+systemctl enable nodeapp-3001
+systemctl start nodeapp-3001
 
 echo ""
 echo "================================================"
 echo " $HOSTNAME aprovisionado exitosamente"
 echo "  Node.js : $(node --version)"
 echo "  Consul  : $(consul --version | head -1)"
-echo "  App URL : http://192.168.100.$([ "$HOSTNAME" = "web1" ] && echo 11 || echo 12):3000"
+echo "  Replicas: :3000 y :3001"
 echo "================================================"

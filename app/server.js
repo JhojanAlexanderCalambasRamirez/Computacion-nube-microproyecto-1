@@ -3,7 +3,7 @@
 const http = require('http');
 const os   = require('os');
 
-const PORT = 3000;
+const PORT = parseInt(process.env.PORT) || 3000;
 
 function getPrivateIP() {
   const interfaces = os.networkInterfaces();

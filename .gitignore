@@ -1,2 +1,17 @@
-.Vagrant
-/Douments
+# Vagrant
+.vagrant/
+
+# Documentos del curso (PDFs de la guía)
+Documents/
+
+# Imágenes y capturas de pantalla
+images/
+*.png
+*.jpg
+*.jpeg
+
+# macOS
+.DS_Store
+
+# Logs
+*.log

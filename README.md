@@ -2,19 +2,25 @@
 
 **Computación en la Nube — Universidad Autónoma de Occidente**
 
+**Integrantes:**
+- Jhojan Alexander Calambas
+- Oscar Eduardo Portela
+- Angelo Parra
+
 ---
 
 ## Tabla de Contenidos
 
 1. [¿Qué hace este proyecto?](#1-qué-hace-este-proyecto)
 2. [Arquitectura](#2-arquitectura)
-3. [Estructura de archivos](#3-estructura-de-archivos)
-4. [Requisitos previos](#4-requisitos-previos)
-5. [Levantar el entorno](#5-levantar-el-entorno)
-6. [Verificar que todo funciona](#6-verificar-que-todo-funciona)
-7. [Guía de demostración para el docente](#7-guía-de-demostración-para-el-docente)
-8. [Comandos de referencia rápida](#8-comandos-de-referencia-rápida)
-9. [Explicación de cada archivo](#9-explicación-de-cada-archivo)
+3. [Escalabilidad — Réplicas por nodo](#3-escalabilidad--réplicas-por-nodo)
+4. [Estructura de archivos](#4-estructura-de-archivos)
+5. [Requisitos previos](#5-requisitos-previos)
+6. [Levantar el entorno](#6-levantar-el-entorno)
+7. [Verificar que todo funciona](#7-verificar-que-todo-funciona)
+8. [Guía de demostración para el docente](#8-guía-de-demostración-para-el-docente)
+9. [Comandos de referencia rápida](#9-comandos-de-referencia-rápida)
+10. [Explicación de cada archivo](#10-explicación-de-cada-archivo)
 
 ---
 
@@ -35,10 +41,12 @@ Tu navegador (Mac)
       │
       ▼ localhost:8080
 ┌─────────────┐
-│   HAProxy   │  ← balancea en Round Robin
+│   HAProxy   │  ← balancea en Round Robin (4 backends)
 └──────┬──────┘
-       ├──► web1:3000  (Node.js)
-       └──► web2:3000  (Node.js)
+       ├──► web1:3000  (Node.js réplica 1)
+       ├──► web1:3001  (Node.js réplica 2)
+       ├──► web2:3000  (Node.js réplica 1)
+       └──► web2:3001  (Node.js réplica 2)
 ```
 
 **Consul** actúa como Service Mesh: registra automáticamente el servicio `web` en ambas VMs y hace health checks cada 5 segundos. Si un nodo cae, Consul lo detecta.
@@ -71,6 +79,7 @@ Mac anfitrión (Apple Silicon)
 │  ┌──────────────┐         ┌──────────────┐
 │  │    web1      │         │    web2      │
 │  │ Node.js:3000 │         │ Node.js:3000 │
+│  │ Node.js:3001 │         │ Node.js:3001 │
 │  │ Consul Server│         │ Consul Agent │
 │  └──────────────┘         └──────────────┘
 │         ▲                        ▲
@@ -81,7 +90,67 @@ Mac anfitrión (Apple Silicon)
 
 ---
 
-## 3. Estructura de archivos
+## 3. Escalabilidad — Réplicas por nodo
+
+Cada VM corre **dos instancias independientes** del servidor Node.js en puertos distintos. HAProxy distribuye el tráfico entre las 4 réplicas en total.
+
+### ¿Por qué esto es escalabilidad?
+
+En un servidor real con múltiples núcleos de CPU, Node.js es monohilo por naturaleza: un solo proceso solo usa 1 núcleo. Lanzar múltiples réplicas del mismo proceso permite aprovechar todos los núcleos de la máquina, aumentando el throughput sin necesidad de añadir hardware.
+
+### Cómo está implementado
+
+| Réplica | VM | Puerto | Servicio systemd |
+|---------|----|--------|-----------------|
+| web1-r1 | web1 | 3000 | `nodeapp-3000` |
+| web1-r2 | web1 | 3001 | `nodeapp-3001` |
+| web2-r1 | web2 | 3000 | `nodeapp-3000` |
+| web2-r2 | web2 | 3001 | `nodeapp-3001` |
+
+Cada servicio systemd pasa la variable de entorno `PORT` al proceso Node.js:
+
+```ini
+Environment=PORT=3001
+ExecStart=/usr/bin/node server.js
+```
+
+Y en `haproxy.cfg` los 4 backends quedan así:
+
+```
+server  web1-r1 192.168.100.11:3000 check inter 5s fall 2 rise 2
+server  web1-r2 192.168.100.11:3001 check inter 5s fall 2 rise 2
+server  web2-r1 192.168.100.12:3000 check inter 5s fall 2 rise 2
+server  web2-r2 192.168.100.12:3001 check inter 5s fall 2 rise 2
+```
+
+### Verificar las réplicas
+
+```bash
+# Ver las 2 réplicas corriendo en web1
+vagrant ssh web1 -c "sudo systemctl status nodeapp-3000 --no-pager && sudo systemctl status nodeapp-3001 --no-pager"
+
+# Verificar que ambos puertos responden en web1
+vagrant ssh web1 -c "curl -s http://localhost:3000/health && curl -s http://localhost:3001/health"
+
+# Ver los 4 backends en la GUI de HAProxy (todos deben estar en verde)
+# http://localhost:8404/stats
+```
+
+### Demostrar el Round Robin entre las 4 réplicas
+
+```bash
+for i in {1..8}; do
+  echo -n "Peticion $i -> puerto: "
+  curl -s http://localhost:8080/health | python3 -c "import sys,json; d=json.load(sys.stdin); print(f\"{d['host']}:{d.get('port','?')}\")" 2>/dev/null || \
+  curl -s http://localhost:8080 | grep -oP 'desde <strong>\K[^<]+'
+done
+```
+
+---
+
+## 4. Estructura de archivos
+
+
 
 ```
 microproyecto1/
@@ -111,7 +180,7 @@ microproyecto1/
 
 ---
 
-## 4. Requisitos previos
+## 5. Requisitos previos
 
 Verificar que tienes instalado en el Mac:
 
@@ -130,7 +199,7 @@ npm install -g artillery
 
 ---
 
-## 5. Levantar el entorno
+## 6. Levantar el entorno
 
 Desde la carpeta raíz del proyecto:
 
@@ -165,7 +234,7 @@ haproxy: aprovisionado exitosamente
 
 ---
 
-## 6. Verificar que todo funciona
+## 7. Verificar que todo funciona
 
 ### 6.1 Balanceo de carga (Round Robin)
 
@@ -227,7 +296,7 @@ Abrir en el navegador: **http://localhost:8404/stats**
 - Usuario: `admin`
 - Contraseña: `admin`
 
-Debes ver `web1` y `web2` en estado **verde (UP)**.
+Debes ver los 4 backends `web1-r1`, `web1-r2`, `web2-r1`, `web2-r2` en estado **verde (UP)**.
 
 ### 6.5 Consul UI
 
@@ -237,7 +306,7 @@ Muestra los servicios registrados y su estado de salud.
 
 ---
 
-## 7. Guía de demostración para el docente
+## 8. Guía de demostración para el docente
 
 Seguir este orden para una demostración completa y clara.
 
@@ -252,12 +321,12 @@ vagrant status
 
 ```bash
 # Mostrar servicios activos en web1
-vagrant ssh web1 -c "systemctl status consul --no-pager && systemctl status nodeapp --no-pager"
+vagrant ssh web1 -c "systemctl status consul --no-pager && systemctl status nodeapp-3000 --no-pager && systemctl status nodeapp-3001 --no-pager"
 ```
 
 ```bash
 # Mostrar servicios activos en web2
-vagrant ssh web2 -c "systemctl status consul --no-pager && systemctl status nodeapp --no-pager"
+vagrant ssh web2 -c "systemctl status consul --no-pager && systemctl status nodeapp-3000 --no-pager && systemctl status nodeapp-3001 --no-pager"
 ```
 
 ```bash
@@ -307,8 +376,8 @@ done
 ### DEMO 4: Alta disponibilidad — simulación de fallo de un nodo
 
 ```bash
-# Detener el servicio Node.js en web1
-vagrant ssh web1 -c "sudo systemctl stop nodeapp"
+# Detener las 2 réplicas de Node.js en web1
+vagrant ssh web1 -c "sudo systemctl stop nodeapp-3000 nodeapp-3001"
 ```
 
 ```bash
@@ -320,13 +389,13 @@ done
 ```
 
 ```bash
-# Ver el estado en HAProxy stats (web1 debe aparecer en ROJO)
+# Ver el estado en HAProxy stats (web1-r1 y web1-r2 deben aparecer en ROJO)
 # Abrir en navegador: http://localhost:8404/stats
 ```
 
 ```bash
-# Restaurar el servicio
-vagrant ssh web1 -c "sudo systemctl start nodeapp"
+# Restaurar las réplicas de web1
+vagrant ssh web1 -c "sudo systemctl start nodeapp-3000 nodeapp-3001"
 ```
 
 Después de ~10 segundos, web1 vuelve a recibir tráfico automáticamente.
@@ -336,11 +405,11 @@ Después de ~10 segundos, web1 vuelve a recibir tráfico automáticamente.
 ### DEMO 5: Página de error 503 personalizada
 
 ```bash
-# Detener Node.js en AMBOS servidores
-vagrant ssh web1 -c "sudo systemctl stop nodeapp"
-vagrant ssh web2 -c "sudo systemctl stop nodeapp"
+# Detener las 4 réplicas de Node.js
+vagrant ssh web1 -c "sudo systemctl stop nodeapp-3000 nodeapp-3001"
+vagrant ssh web2 -c "sudo systemctl stop nodeapp-3000 nodeapp-3001"
 
-# Esperar 15 segundos para que HAProxy detecte que ambos fallen
+# Esperar 15 segundos para que HAProxy detecte que los 4 backends fallen
 sleep 15
 ```
 
@@ -353,9 +422,9 @@ curl http://localhost:8080
 La página mostrará: **"503 — Servicio No Disponible"** con diseño personalizado.
 
 ```bash
-# Restaurar los servidores
-vagrant ssh web1 -c "sudo systemctl start nodeapp"
-vagrant ssh web2 -c "sudo systemctl start nodeapp"
+# Restaurar todos los servidores
+vagrant ssh web1 -c "sudo systemctl start nodeapp-3000 nodeapp-3001"
+vagrant ssh web2 -c "sudo systemctl start nodeapp-3000 nodeapp-3001"
 ```
 
 ---
@@ -389,7 +458,7 @@ Durante la prueba, abrir en paralelo la GUI de HAProxy para ver el tráfico en t
 
 ---
 
-## 8. Comandos de referencia rápida
+## 9. Comandos de referencia rápida
 
 ### Vagrant
 
@@ -409,23 +478,29 @@ vagrant provision       # Re-ejecutar scripts de aprovisionamiento
 ```bash
 # Estado de servicios
 sudo systemctl status consul
-sudo systemctl status nodeapp
+sudo systemctl status nodeapp-3000
+sudo systemctl status nodeapp-3001
 
 # Reiniciar servicios
 sudo systemctl restart consul
-sudo systemctl restart nodeapp
+sudo systemctl restart nodeapp-3000 nodeapp-3001
+
+# Detener/iniciar réplicas individualmente
+sudo systemctl stop nodeapp-3000
+sudo systemctl start nodeapp-3000
 
 # Ver logs en tiempo real
 sudo journalctl -fu consul
-sudo journalctl -fu nodeapp
+sudo journalctl -fu nodeapp-3000
+sudo journalctl -fu nodeapp-3001
 
 # Ver cluster Consul
 consul members
 consul catalog services
 
-# Verificar app local
-curl http://localhost:3000
+# Verificar ambas réplicas localmente
 curl http://localhost:3000/health
+curl http://localhost:3001/health
 ```
 
 ### Dentro de la VM (haproxy)
@@ -463,7 +538,7 @@ artillery quick --count 20 --num 2 http://localhost:8080
 
 ---
 
-## 9. Explicación de cada archivo
+## 10. Explicación de cada archivo
 
 ### `Vagrantfile`
 
