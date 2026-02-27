@@ -71,6 +71,12 @@ open http://localhost:8404/stats
 ## DEMO 4 — Balanceo Round Robin entre 4 replicas
 
 ```bash
+# Ver los 4 backends en verde en HAProxy stats
+open http://localhost:8404/stats
+# usuario: admin | contrasena: admin
+```
+
+```bash
 for i in {1..8}; do
   echo -n "Peticion $i -> "
   curl -s http://localhost:8080/health | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['host']+':'+str(d['port']))"
