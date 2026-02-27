@@ -415,7 +415,7 @@ done
 ```bash
 # Restaurar la replica
 vagrant ssh web1 -c "sudo systemctl start nodeapp-3000"
-consul reload  # solo si estuvo caida mas de 1 minuto
+vagrant ssh web1 -c "consul reload"  # solo si estuvo caida mas de 1 minuto
 ```
 
 ---
