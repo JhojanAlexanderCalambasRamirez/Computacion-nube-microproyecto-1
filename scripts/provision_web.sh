@@ -53,8 +53,11 @@ else
   cp /vagrant/consul/client.json /etc/consul.d/consul.json
 fi
 
-# Definicion del servicio web (ambos nodos)
-cp /vagrant/consul/web-service.json /etc/consul.d/web-service.json
+# Definicion del servicio web: una entrada por replica en Consul
+# consul-template en haproxy leera estas entradas para generar haproxy.cfg
+rm -f /etc/consul.d/web-service.json
+cp /vagrant/consul/web-service-3000.json /etc/consul.d/web-service-3000.json
+cp /vagrant/consul/web-service-3001.json /etc/consul.d/web-service-3001.json
 
 # ── 6. Crear servicios systemd ────────────────────
 echo ">>> [6/6] Configurando servicios systemd..."

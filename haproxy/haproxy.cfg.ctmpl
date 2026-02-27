@@ -1,0 +1,46 @@
+global
+    log stdout format raw local0
+    maxconn 4096
+
+defaults
+    log     global
+    mode    http
+    option  httplog
+    option  dontlognull
+    timeout connect 5000ms
+    timeout client  50000ms
+    timeout server  50000ms
+    errorfile 503 /etc/haproxy/errors/503.http
+
+# ─────────────────────────────────────────────────
+# FRONTEND: recibe trafico del cliente en puerto 80
+# ─────────────────────────────────────────────────
+frontend http_front
+    bind *:80
+    default_backend web_servers
+
+# ─────────────────────────────────────────────────
+# BACKEND: generado dinamicamente desde Consul
+# consul-template consulta el catalogo de Consul y
+# solo incluye replicas con health check PASSING.
+# Se regenera automaticamente ante cualquier cambio.
+# ─────────────────────────────────────────────────
+backend web_servers
+    balance roundrobin
+    option  httpchk GET /health
+{{range service "web"}}    server {{.Node}}-{{.Port}} {{.Address}}:{{.Port}} check inter 5s fall 2 rise 2
+{{end}}
+# ─────────────────────────────────────────────────
+# ESTADISTICAS: GUI accesible en puerto 8404
+# Desde Mac: http://localhost:8404/stats
+# Usuario: admin | Contrasena: admin
+# ─────────────────────────────────────────────────
+listen stats
+    bind *:8404
+    stats enable
+    stats uri /stats
+    stats refresh 10s
+    stats auth admin:admin
+    stats show-legends
+    stats show-node
+    stats admin if TRUE

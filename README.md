@@ -30,9 +30,9 @@ Se despliegan **3 máquinas virtuales** con Vagrant + VirtualBox que conforman u
 
 | VM | IP | Rol |
 |----|----|-----|
-| `web1` | 192.168.100.11 | Servidor Node.js + **Consul Server** |
-| `web2` | 192.168.100.12 | Servidor Node.js + Consul Agent |
-| `haproxy` | 192.168.100.10 | Balanceador de carga HAProxy |
+| `web1` | 192.168.100.11 | Node.js x2 + Consul Server |
+| `web2` | 192.168.100.12 | Node.js x2 + Consul Agent |
+| `haproxy` | 192.168.100.10 | HAProxy + consul-template |
 
 El flujo de una petición es:
 
@@ -42,16 +42,14 @@ Tu navegador (Mac)
       ▼ localhost:8080
 ┌─────────────┐
 │   HAProxy   │  ← balancea en Round Robin (4 backends)
-└──────┬──────┘
+└──────┬──────┘   config generada dinamicamente por consul-template
        ├──► web1:3000  (Node.js réplica 1)
        ├──► web1:3001  (Node.js réplica 2)
        ├──► web2:3000  (Node.js réplica 1)
        └──► web2:3001  (Node.js réplica 2)
 ```
 
-**Consul** actúa como Service Mesh: registra automáticamente el servicio `web` en ambas VMs y hace health checks cada 5 segundos. Si un nodo cae, Consul lo detecta.
-
-**Artillery** genera carga de prueba desde tu Mac contra `localhost:8080`, midiendo el rendimiento del sistema bajo tráfico real.
+**Consul** actúa como Service Mesh: registra los servicios y hace health checks cada 5s. **consul-template** escucha esos cambios y regenera la configuración de HAProxy automáticamente. **Artillery** genera carga de prueba desde el Mac.
 
 ---
 
@@ -68,24 +66,41 @@ Mac anfitrión (Apple Silicon)
 │         ┌──────────────┴──────────────────────┐   │
 │         │                                     │   │
 │    192.168.100.10                              │   │
-│    ┌────────────┐   port :80                  │   │
-│    │  HAProxy   │◄──────────────────────────────◄─┘
-│    │            │   port :8404 (stats)◄──────────◄─┘
-│    └─────┬──────┘
-│          │ Round Robin
-│    ┌─────┴──────────────────┐
-│    │                        │
-│  192.168.100.11           192.168.100.12
-│  ┌──────────────┐         ┌──────────────┐
-│  │    web1      │         │    web2      │
-│  │ Node.js:3000 │         │ Node.js:3000 │
-│  │ Node.js:3001 │         │ Node.js:3001 │
-│  │ Consul Server│         │ Consul Agent │
-│  └──────────────┘         └──────────────┘
-│         ▲                        ▲
-│         └────── Consul RPC ──────┘
-│                 (service discovery
-│                  + health checks)
+│    ┌──────────────────┐  port :80              │   │
+│    │  HAProxy         │◄───────────────────────────◄─┘
+│    │  consul-template │  port :8404 (stats)◄───────◄─┘
+│    └────────┬─────────┘
+│             │ consulta catalogo      Round Robin
+│             ▼                     ┌──────────────┐
+│    192.168.100.11:8500 (Consul)   │  4 backends  │
+│             │                     └──────────────┘
+│    ┌────────┴──────────────────────────────┐
+│    │                                       │
+│  192.168.100.11                       192.168.100.12
+│  ┌──────────────┐                    ┌──────────────┐
+│  │    web1      │                    │    web2      │
+│  │ Node.js:3000 │                    │ Node.js:3000 │
+│  │ Node.js:3001 │                    │ Node.js:3001 │
+│  │ Consul Server│                    │ Consul Agent │
+│  └──────────────┘                    └──────────────┘
+│         ▲                                   ▲
+│         └──────────── Consul RPC ───────────┘
+│                  (service discovery
+│                   + health checks)
+```
+
+**Flujo cuando una réplica cae:**
+```
+Consul detecta fallo en web1:3000
+       │
+       ▼
+consul-template regenera haproxy.cfg (sin web1:3000)
+       │
+       ▼
+HAProxy se recarga automaticamente
+       │
+       ▼
+El trafico se redistribuye entre las 3 replicas restantes
 ```
 
 ---
@@ -96,83 +111,90 @@ Cada VM corre **dos instancias independientes** del servidor Node.js en puertos 
 
 ### ¿Por qué esto es escalabilidad?
 
-En un servidor real con múltiples núcleos de CPU, Node.js es monohilo por naturaleza: un solo proceso solo usa 1 núcleo. Lanzar múltiples réplicas del mismo proceso permite aprovechar todos los núcleos de la máquina, aumentando el throughput sin necesidad de añadir hardware.
+Node.js es monohilo: un solo proceso usa únicamente 1 núcleo de CPU. Con 2 réplicas por VM se aprovechan ambos núcleos, duplicando el throughput sin añadir hardware.
 
 ### Cómo está implementado
 
 | Réplica | VM | Puerto | Servicio systemd |
 |---------|----|--------|-----------------|
-| web1-r1 | web1 | 3000 | `nodeapp-3000` |
-| web1-r2 | web1 | 3001 | `nodeapp-3001` |
-| web2-r1 | web2 | 3000 | `nodeapp-3000` |
-| web2-r2 | web2 | 3001 | `nodeapp-3001` |
+| web1-3000 | web1 | 3000 | `nodeapp-3000` |
+| web1-3001 | web1 | 3001 | `nodeapp-3001` |
+| web2-3000 | web2 | 3000 | `nodeapp-3000` |
+| web2-3001 | web2 | 3001 | `nodeapp-3001` |
 
-Cada servicio systemd pasa la variable de entorno `PORT` al proceso Node.js:
+Cada servicio systemd pasa la variable de entorno `PORT`:
 
 ```ini
 Environment=PORT=3001
 ExecStart=/usr/bin/node server.js
 ```
 
-Y en `haproxy.cfg` los 4 backends quedan así:
+consul-template genera el backend dinámicamente desde el catálogo de Consul:
 
 ```
-server  web1-r1 192.168.100.11:3000 check inter 5s fall 2 rise 2
-server  web1-r2 192.168.100.11:3001 check inter 5s fall 2 rise 2
-server  web2-r1 192.168.100.12:3000 check inter 5s fall 2 rise 2
-server  web2-r2 192.168.100.12:3001 check inter 5s fall 2 rise 2
+server web1-3000 192.168.100.11:3000 check inter 5s fall 2 rise 2
+server web1-3001 192.168.100.11:3001 check inter 5s fall 2 rise 2
+server web2-3000 192.168.100.12:3000 check inter 5s fall 2 rise 2
+server web2-3001 192.168.100.12:3001 check inter 5s fall 2 rise 2
 ```
 
 ### Verificar las réplicas
 
 ```bash
-# Ver las 2 réplicas corriendo en web1
+# Ver los 2 servicios corriendo en web1
 vagrant ssh web1 -c "sudo systemctl status nodeapp-3000 --no-pager && sudo systemctl status nodeapp-3001 --no-pager"
 
-# Verificar que ambos puertos responden en web1
-vagrant ssh web1 -c "curl -s http://localhost:3000/health && curl -s http://localhost:3001/health"
-
-# Ver los 4 backends en la GUI de HAProxy (todos deben estar en verde)
-# http://localhost:8404/stats
+# Verificar que ambos puertos responden
+vagrant ssh web1 -c "curl -s http://localhost:3000/health && echo && curl -s http://localhost:3001/health"
 ```
 
 ### Demostrar el Round Robin entre las 4 réplicas
 
 ```bash
 for i in {1..8}; do
-  echo -n "Peticion $i -> puerto: "
-  curl -s http://localhost:8080/health | python3 -c "import sys,json; d=json.load(sys.stdin); print(f\"{d['host']}:{d.get('port','?')}\")" 2>/dev/null || \
-  curl -s http://localhost:8080 | grep -oP 'desde <strong>\K[^<]+'
+  echo -n "Peticion $i -> "
+  curl -s http://localhost:8080/health | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['host']+':'+str(d['port']))"
 done
+```
+
+Salida esperada:
+```
+Peticion 1 -> web1:3000
+Peticion 2 -> web1:3001
+Peticion 3 -> web2:3000
+Peticion 4 -> web2:3001
+Peticion 5 -> web1:3000
+...
 ```
 
 ---
 
 ## 4. Estructura de archivos
 
-
-
 ```
 microproyecto1/
-├── Vagrantfile                   # Define las 3 VMs
+├── Vagrantfile                        # Define las 3 VMs
 ├── app/
-│   ├── server.js                 # Servidor HTTP Node.js (sin dependencias)
-│   └── package.json              # Metadatos del app
+│   ├── server.js                      # Servidor HTTP Node.js (sin dependencias)
+│   └── package.json                   # Metadatos del app
 ├── consul/
-│   ├── server.json               # Config Consul para web1 (modo server)
-│   ├── client.json               # Config Consul para web2 (modo agent)
-│   └── web-service.json          # Registro del servicio "web" en Consul
+│   ├── server.json                    # Config Consul para web1 (modo server)
+│   ├── client.json                    # Config Consul para web2 (modo agent)
+│   ├── web-service-3000.json          # Registro replica puerto 3000 en Consul
+│   └── web-service-3001.json          # Registro replica puerto 3001 en Consul
 ├── haproxy/
-│   ├── haproxy.cfg               # Configuración del balanceador
+│   ├── haproxy.cfg                    # Config estatica (respaldo inicial)
+│   ├── haproxy.cfg.ctmpl              # Template dinamico para consul-template
+│   ├── consul-template.hcl            # Config de consul-template
 │   └── errors/
-│       └── 503.http              # Página de error personalizada
+│       └── 503.http                   # Pagina de error personalizada
 ├── scripts/
-│   ├── provision_web.sh          # Instala Node.js + Consul en web1/web2
-│   └── provision_haproxy.sh      # Instala y configura HAProxy
+│   ├── provision_web.sh               # Instala Node.js + Consul en web1/web2
+│   └── provision_haproxy.sh           # Instala HAProxy + consul-template
 ├── artillery/
-│   └── load-test.yml             # Escenarios de prueba de carga
+│   └── load-test.yml                  # Escenarios de prueba de carga
 └── Documents/
-    ├── Microproyecto1.pdf        # Guía oficial del proyecto
+    ├── Microproyecto1.pdf
     ├── Practica Aprovisionamiento.pdf
     ├── Practica Balanceo de Carga.pdf
     └── Practica ServiceMesh.pdf
@@ -182,12 +204,10 @@ microproyecto1/
 
 ## 5. Requisitos previos
 
-Verificar que tienes instalado en el Mac:
-
 ```bash
 vagrant --version     # >= 2.3
 VBoxManage --version  # VirtualBox >= 6.1
-node --version        # cualquier versión (para Artillery)
+node --version        # para Artillery
 artillery --version   # >= 2.0
 ```
 
@@ -201,137 +221,123 @@ npm install -g artillery
 
 ## 6. Levantar el entorno
 
-Desde la carpeta raíz del proyecto:
-
 ```bash
 cd ~/compunube/microproyecto1
 
-# Levantar y provisionar las 3 VMs (primera vez ~5-10 min)
+# Primera vez (~10-15 min)
 vagrant up
 
-# Si las VMs ya existen y quieres re-provisionar
-vagrant provision
-
-# Para ver el estado de las VMs
+# Ver estado
 vagrant status
 ```
 
-Salida esperada después de `vagrant up`:
-
+Salida esperada:
 ```
-web1: aprovisionado exitosamente
-  Node.js : v20.x.x
-  Consul  : Consul v1.17.1
-
-web2: aprovisionado exitosamente
-  Node.js : v20.x.x
-  Consul  : Consul v1.17.1
-
-haproxy: aprovisionado exitosamente
-  HAProxy  : HAProxy version 2.x
-  Balanceador  : http://192.168.100.10
+web1     running (virtualbox)
+web2     running (virtualbox)
+haproxy  running (virtualbox)
 ```
 
 ---
 
 ## 7. Verificar que todo funciona
 
-### 6.1 Balanceo de carga (Round Robin)
-
-Desde tu Mac, abrir la terminal y ejecutar:
+### 7.1 Round Robin entre las 4 réplicas
 
 ```bash
-for i in {1..8}; do curl -s http://localhost:8080 | grep "<h1>"; done
+for i in {1..8}; do
+  echo -n "Peticion $i -> "
+  curl -s http://localhost:8080/health | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['host']+':'+str(d['port']))"
+done
 ```
 
-Debes ver que alterna entre `web1` y `web2`:
-
-```
-  <h1>Hola desde <strong>web1</strong></h1>
-  <h1>Hola desde <strong>web2</strong></h1>
-  <h1>Hola desde <strong>web1</strong></h1>
-  <h1>Hola desde <strong>web2</strong></h1>
-```
-
-> **Nota:** El navegador usa HTTP keep-alive, por lo que siempre mostrará el mismo servidor. Usar `curl` es la forma correcta de verificar el Round Robin.
-
-### 6.2 Health check de los nodos
+### 7.2 Health check directo
 
 ```bash
 curl http://localhost:8080/health
 ```
 
-Respuesta JSON esperada:
-
+Respuesta esperada:
 ```json
-{"status":"ok","host":"web1","ip":"192.168.100.11"}
+{"status":"ok","host":"web1","ip":"192.168.100.11","port":3000}
 ```
 
-### 6.3 Consul Service Mesh
-
-Conectarse a web1 y verificar el cluster:
+### 7.3 Consul cluster
 
 ```bash
 vagrant ssh web1 -c "consul members"
 ```
 
 Salida esperada:
-
 ```
-Node   Address                Status  Type    Build    Protocol  DC   Partition  Segment
-web1   192.168.100.11:8301    alive   server  1.17.1   2         dc1  default    <all>
-web2   192.168.100.12:8301    alive   client  1.17.1   2         dc1  default    <default>
+Node   Address                Status  Type    Build
+web1   192.168.100.11:8301    alive   server  1.17.1
+web2   192.168.100.12:8301    alive   client  1.17.1
 ```
 
-Verificar el servicio registrado en Consul:
+### 7.4 Servicios registrados en Consul
 
 ```bash
 vagrant ssh web1 -c "curl -s http://localhost:8500/v1/health/service/web | python3 -m json.tool"
 ```
 
-### 6.4 GUI de estadísticas HAProxy
+Deben aparecer 4 instancias del servicio `web` (2 por nodo).
 
-Abrir en el navegador: **http://localhost:8404/stats**
+### 7.5 consul-template activo
 
-- Usuario: `admin`
-- Contraseña: `admin`
+```bash
+vagrant ssh haproxy -c "sudo systemctl status consul-template --no-pager"
+```
 
-Debes ver los 4 backends `web1-r1`, `web1-r2`, `web2-r1`, `web2-r2` en estado **verde (UP)**.
+### 7.6 haproxy.cfg generado dinamicamente
 
-### 6.5 Consul UI
+```bash
+vagrant ssh haproxy -c "cat /etc/haproxy/haproxy.cfg" | grep "server w"
+```
 
-Abrir en el navegador (desde web1): **http://192.168.100.11:8500/ui**
+Salida esperada (4 backends con nombres generados por consul-template):
+```
+    server web1-3000 192.168.100.11:3000 check inter 5s fall 2 rise 2
+    server web1-3001 192.168.100.11:3001 check inter 5s fall 2 rise 2
+    server web2-3000 192.168.100.12:3000 check inter 5s fall 2 rise 2
+    server web2-3001 192.168.100.12:3001 check inter 5s fall 2 rise 2
+```
 
-Muestra los servicios registrados y su estado de salud.
+### 7.7 GUI de estadísticas HAProxy
+
+Abrir: **http://localhost:8404/stats** — usuario: `admin` / contraseña: `admin`
+
+Deben aparecer los 4 backends en **verde**.
+
+### 7.8 Consul UI
+
+Abrir: **http://192.168.100.11:8500/ui**
 
 ---
 
 ## 8. Guía de demostración para el docente
 
-Seguir este orden para una demostración completa y clara.
-
 ---
 
-### DEMO 1: Infraestructura levantada (Aprovisionamiento)
+### DEMO 1: Infraestructura levantada
 
 ```bash
-# Mostrar que las 3 VMs están corriendo
 vagrant status
 ```
 
 ```bash
-# Mostrar servicios activos en web1
-vagrant ssh web1 -c "systemctl status consul --no-pager && systemctl status nodeapp-3000 --no-pager && systemctl status nodeapp-3001 --no-pager"
+# Servicios en web1: consul + 2 replicas Node.js
+vagrant ssh web1 -c "systemctl status consul nodeapp-3000 nodeapp-3001 --no-pager"
 ```
 
 ```bash
-# Mostrar servicios activos en web2
-vagrant ssh web2 -c "systemctl status consul --no-pager && systemctl status nodeapp-3000 --no-pager && systemctl status nodeapp-3001 --no-pager"
+# Servicios en web2
+vagrant ssh web2 -c "systemctl status consul nodeapp-3000 nodeapp-3001 --no-pager"
 ```
 
 ```bash
-# Mostrar servicios activos en haproxy
-vagrant ssh haproxy -c "systemctl status haproxy --no-pager"
+# Servicios en haproxy: haproxy + consul-template
+vagrant ssh haproxy -c "systemctl status haproxy consul-template --no-pager"
 ```
 
 ---
@@ -339,122 +345,120 @@ vagrant ssh haproxy -c "systemctl status haproxy --no-pager"
 ### DEMO 2: Service Mesh con Consul
 
 ```bash
-# Ver todos los nodos del cluster Consul
+# Ver el cluster de Consul
 vagrant ssh web1 -c "consul members"
 ```
 
 ```bash
-# Ver los servicios registrados y su health check
-vagrant ssh web1 -c "curl -s http://localhost:8500/v1/health/service/web?pretty"
+# Ver los 4 servicios registrados con su estado de salud
+vagrant ssh web1 -c "curl -s http://localhost:8500/v1/health/service/web | python3 -m json.tool"
 ```
 
 **Puntos a resaltar:**
-- web1 actúa como **Consul Server** (bootstrap_expect: 1)
-- web2 actúa como **Consul Agent** y se une automáticamente al server via `retry_join`
-- Consul hace health checks HTTP a `/health` cada 5 segundos
-- Si el health check falla 2 veces seguidas, marca el servicio como crítico
+- web1 es **Consul Server**, web2 es **Consul Agent**
+- Consul hace health checks a `/health` cada 5 segundos en cada réplica
+- Los servicios se registran via archivos JSON en `/etc/consul.d/`
 
 ---
 
-### DEMO 3: Balanceo de carga Round Robin
+### DEMO 3: consul-template conecta HAProxy con Consul
 
 ```bash
-# Demostrar que las peticiones se distribuyen entre web1 y web2
-for i in {1..10}; do
-  echo -n "Peticion $i: "
-  curl -s http://localhost:8080 | grep -oP 'desde <strong>\K[^<]+'
+# Ver el haproxy.cfg generado dinamicamente (nota los nombres web1-3000 etc.)
+vagrant ssh haproxy -c "cat /etc/haproxy/haproxy.cfg"
+```
+
+```bash
+# Ver los logs de consul-template
+vagrant ssh haproxy -c "sudo journalctl -u consul-template --no-pager -n 20"
+```
+
+**Puntos a resaltar:**
+- `haproxy.cfg` es generado por consul-template, no es un archivo estático
+- consul-template consulta la API de Consul (`192.168.100.11:8500`)
+- Solo incluye replicas con health check **passing** en Consul
+
+---
+
+### DEMO 4: Round Robin entre las 4 réplicas
+
+```bash
+for i in {1..8}; do
+  echo -n "Peticion $i -> "
+  curl -s http://localhost:8080/health | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['host']+':'+str(d['port']))"
 done
 ```
 
-**Puntos a resaltar:**
-- HAProxy balancea en **Round Robin**: petición 1 → web1, petición 2 → web2, etc.
-- El balanceo es transparente: el cliente solo conoce `localhost:8080`
-- HAProxy hace health checks propios a `/health` cada 5 segundos (independiente de Consul)
-
 ---
 
-### DEMO 4: Alta disponibilidad — simulación de fallo de un nodo
+### DEMO 5: Alta disponibilidad — consul-template reacciona automáticamente
 
 ```bash
-# Detener las 2 réplicas de Node.js en web1
-vagrant ssh web1 -c "sudo systemctl stop nodeapp-3000 nodeapp-3001"
+# Detener una replica
+vagrant ssh web1 -c "sudo systemctl stop nodeapp-3000"
 ```
 
 ```bash
-# Verificar que TODAS las peticiones van ahora a web2
+# Esperar ~15 segundos y ver como consul-template borra la replica del config
+vagrant ssh haproxy -c "cat /etc/haproxy/haproxy.cfg" | grep "server w"
+# web1-3000 ya no aparece
+```
+
+```bash
+# El trafico sigue fluyendo hacia las 3 replicas restantes
 for i in {1..6}; do
-  echo -n "Peticion $i: "
-  curl -s http://localhost:8080 | grep -oP 'desde <strong>\K[^<]+'
+  echo -n "Peticion $i -> "
+  curl -s http://localhost:8080/health | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['host']+':'+str(d['port']))"
 done
 ```
 
 ```bash
-# Ver el estado en HAProxy stats (web1-r1 y web1-r2 deben aparecer en ROJO)
-# Abrir en navegador: http://localhost:8404/stats
+# Restaurar la replica
+vagrant ssh web1 -c "sudo systemctl start nodeapp-3000"
+consul reload  # solo si estuvo caida mas de 1 minuto
 ```
-
-```bash
-# Restaurar las réplicas de web1
-vagrant ssh web1 -c "sudo systemctl start nodeapp-3000 nodeapp-3001"
-```
-
-Después de ~10 segundos, web1 vuelve a recibir tráfico automáticamente.
 
 ---
 
-### DEMO 5: Página de error 503 personalizada
+### DEMO 6: Página de error 503 personalizada
 
 ```bash
-# Detener las 4 réplicas de Node.js
+# Detener las 4 replicas
 vagrant ssh web1 -c "sudo systemctl stop nodeapp-3000 nodeapp-3001"
 vagrant ssh web2 -c "sudo systemctl stop nodeapp-3000 nodeapp-3001"
-
-# Esperar 15 segundos para que HAProxy detecte que los 4 backends fallen
 sleep 15
 ```
 
 ```bash
-# Acceder al balanceador — debe mostrar la página 503 personalizada
 curl http://localhost:8080
-# O abrir en el navegador: http://localhost:8080
+# O abrir en navegador: http://localhost:8080
 ```
 
-La página mostrará: **"503 — Servicio No Disponible"** con diseño personalizado.
-
 ```bash
-# Restaurar todos los servidores
+# Restaurar
 vagrant ssh web1 -c "sudo systemctl start nodeapp-3000 nodeapp-3001"
 vagrant ssh web2 -c "sudo systemctl start nodeapp-3000 nodeapp-3001"
+vagrant ssh web1 -c "consul reload"
+vagrant ssh web2 -c "consul reload"
 ```
 
 ---
 
-### DEMO 6: Prueba de carga con Artillery
+### DEMO 7: Prueba de carga con Artillery
 
 ```bash
-# Desde la carpeta raíz del proyecto (en el Mac, NO dentro de una VM)
 cd ~/compunube/microproyecto1
-
 artillery run artillery/load-test.yml
 ```
 
-La prueba tiene 4 fases:
-
-| Fase | Duración | Tasa de llegada |
-|------|----------|-----------------|
+| Fase | Duración | Tasa |
+|------|----------|------|
 | Calentamiento | 30 s | 5 req/s |
-| Carga normal | 60 s | 20 req/s |
-| Carga alta | 60 s | 50 req/s |
-| Pico de tráfico | 30 s | 100 req/s |
+| Normal | 60 s | 20 req/s |
+| Alta | 60 s | 50 req/s |
+| Pico | 30 s | 100 req/s |
 
-Durante la prueba, abrir en paralelo la GUI de HAProxy para ver el tráfico en tiempo real:
-**http://localhost:8404/stats**
-
-**Puntos a resaltar del reporte Artillery:**
-- `http.response_time` — latencia de respuesta
-- `http.codes.200` — peticiones exitosas
-- `vusers.completed` — usuarios virtuales completados
-- Tasa de errores (debe ser ~0% en condiciones normales)
+Abrir **http://localhost:8404/stats** en paralelo para ver el tráfico distribuido entre los 4 backends.
 
 ---
 
@@ -466,74 +470,66 @@ Durante la prueba, abrir en paralelo la GUI de HAProxy para ver el tráfico en t
 vagrant up              # Levantar todas las VMs
 vagrant halt            # Apagar todas las VMs
 vagrant destroy -f      # Eliminar todas las VMs
-vagrant status          # Ver estado de las VMs
+vagrant status          # Ver estado
 vagrant ssh web1        # Conectarse a web1
-vagrant ssh web2        # Conectarse a web2
-vagrant ssh haproxy     # Conectarse a haproxy
-vagrant provision       # Re-ejecutar scripts de aprovisionamiento
+vagrant provision       # Re-provisionar
 ```
 
-### Dentro de las VMs (web1 / web2)
+### Dentro de web1 / web2
 
 ```bash
-# Estado de servicios
+# Estado
 sudo systemctl status consul
 sudo systemctl status nodeapp-3000
 sudo systemctl status nodeapp-3001
 
-# Reiniciar servicios
-sudo systemctl restart consul
+# Reiniciar
 sudo systemctl restart nodeapp-3000 nodeapp-3001
 
-# Detener/iniciar réplicas individualmente
-sudo systemctl stop nodeapp-3000
-sudo systemctl start nodeapp-3000
-
-# Ver logs en tiempo real
-sudo journalctl -fu consul
+# Logs en tiempo real
 sudo journalctl -fu nodeapp-3000
-sudo journalctl -fu nodeapp-3001
+sudo journalctl -fu consul
 
-# Ver cluster Consul
+# Consul
 consul members
-consul catalog services
+consul reload                          # re-registra servicios del catalogo
 
-# Verificar ambas réplicas localmente
+# Verificar replicas localmente
 curl http://localhost:3000/health
 curl http://localhost:3001/health
 ```
 
-### Dentro de la VM (haproxy)
+### Dentro de haproxy
 
 ```bash
-# Estado de HAProxy
+# Estado
 sudo systemctl status haproxy
+sudo systemctl status consul-template
 
-# Validar configuración
+# Logs de consul-template (ver cuando regenera el config)
+sudo journalctl -fu consul-template
+
+# Ver el config actual generado
+cat /etc/haproxy/haproxy.cfg
+
+# Validar config manualmente
 sudo haproxy -c -f /etc/haproxy/haproxy.cfg
-
-# Ver logs
-sudo journalctl -fu haproxy
 ```
 
-### Desde el Mac (sin entrar a VMs)
+### Desde el Mac
 
 ```bash
-# Probar balanceo
-curl http://localhost:8080
-curl http://localhost:8080/health
+# Ver que replica responde cada peticion
+for i in {1..8}; do
+  echo -n "Peticion $i -> "
+  curl -s http://localhost:8080/health | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['host']+':'+str(d['port']))"
+done
 
-# Loop para ver Round Robin
-for i in {1..10}; do curl -s http://localhost:8080 | grep -oP 'desde <strong>\K[^<]+'; done
-
-# GUI HAProxy
-open http://localhost:8404/stats     # macOS
+# Abrir GUI de HAProxy
+open http://localhost:8404/stats
 
 # Prueba de carga
 artillery run artillery/load-test.yml
-
-# Prueba rápida con Artillery (solo 10 segundos)
-artillery quick --count 20 --num 2 http://localhost:8080
 ```
 
 ---
@@ -541,105 +537,84 @@ artillery quick --count 20 --num 2 http://localhost:8080
 ## 10. Explicación de cada archivo
 
 ### `Vagrantfile`
-
-Define las 3 VMs con VirtualBox. Cada VM tiene:
-- Box: `bento/ubuntu-22.04` (compatible con Apple Silicon ARM64)
-- Red privada: `192.168.100.0/24` para comunicación entre VMs
-- Script de aprovisionamiento propio
-
-Solo `haproxy` expone puertos al Mac anfitrión (8080 y 8404).
+Define las 3 VMs. Box `bento/ubuntu-22.04` (compatible ARM64). Solo `haproxy` expone puertos al Mac (8080 y 8404).
 
 ---
 
 ### `app/server.js`
-
-Servidor HTTP escrito con módulos nativos de Node.js (sin `npm install`). Expone dos rutas:
-
-- `GET /` — página HTML con el hostname y la IP del servidor
-- `GET /health` — JSON `{"status":"ok","host":"...","ip":"..."}` usado por Consul y HAProxy para health checks
+Servidor HTTP con módulos nativos de Node.js. Lee `PORT` desde variable de entorno. Rutas:
+- `GET /` — página HTML con hostname, IP y puerto
+- `GET /health` — JSON `{"status":"ok","host":"...","ip":"...","port":...}` usado por Consul y HAProxy
 
 ---
 
 ### `consul/server.json`
-
-Configuración de Consul para `web1` en modo **server**:
-- `bootstrap_expect: 1` — arranca el cluster con 1 servidor
-- `bind_addr: 192.168.100.11` — escucha en la IP de web1
-- `ui_config.enabled: true` — habilita la interfaz web en puerto 8500
-
----
+Config de Consul para web1 en modo **server**: `bootstrap_expect:1`, UI habilitada en puerto 8500.
 
 ### `consul/client.json`
+Config de Consul para web2 en modo **agent**: `retry_join` apunta a web1 para unirse automáticamente.
 
-Configuración de Consul para `web2` en modo **agent (cliente)**:
-- `retry_join: ["192.168.100.11"]` — se une automáticamente al server de web1
-
----
-
-### `consul/web-service.json`
-
-Registra el servicio `web` en Consul. Consul hace un health check HTTP a `localhost:3000/health` cada 5 segundos. Si falla, marca el servicio como crítico y lo registra en el catálogo para que otros servicios lo vean.
+### `consul/web-service-3000.json` y `web-service-3001.json`
+Registran las 2 réplicas por nodo en el catálogo de Consul con `id` único (`web-3000`, `web-3001`). Consul hace health checks HTTP a cada puerto cada 5 segundos. Si el servicio está crítico más de 1 minuto, lo desregistra automáticamente.
 
 ---
 
 ### `haproxy/haproxy.cfg`
+Config estática usada como respaldo inicial. Una vez que consul-template arranca, este archivo es sobreescrito por la versión dinámica.
 
-Configuración completa de HAProxy:
-- **Frontend** en puerto 80: recibe todo el tráfico entrante
-- **Backend** `web_servers`: balancea en Round Robin entre web1:3000 y web2:3000
-- Health checks propios cada 5s: si un servidor falla 2 veces, lo saca del pool
-- **Stats** en puerto 8404: GUI de monitoreo con usuario/contraseña `admin/admin`
-- **errorfile 503**: apunta a la página personalizada cuando todos los backends caen
+### `haproxy/haproxy.cfg.ctmpl`
+Template que consul-template usa para generar `haproxy.cfg`. La sección clave:
+```
+{{range service "web"}}
+    server {{.Node}}-{{.Port}} {{.Address}}:{{.Port}} check inter 5s fall 2 rise 2
+{{end}}
+```
+Solo incluye réplicas con health check **passing** en Consul.
 
----
+### `haproxy/consul-template.hcl`
+Config de consul-template: dirección del servidor Consul (`192.168.100.11:8500`), archivo template, destino y comando a ejecutar tras cada regeneración (`systemctl reload haproxy`).
 
 ### `haproxy/errors/503.http`
-
-Respuesta HTTP completa (con headers + body HTML) que HAProxy sirve cuando todos los backends están caídos. Muestra una página de error con diseño personalizado en español.
+Página de error personalizada que HAProxy sirve cuando todos los backends están caídos.
 
 ---
 
 ### `scripts/provision_web.sh`
-
-Script de aprovisionamiento que se ejecuta automáticamente en `web1` y `web2` al hacer `vagrant up`:
-
-1. Actualiza paquetes del sistema
-2. Instala Node.js 20 LTS (via NodeSource)
-3. Descarga el binario de Consul detectando la arquitectura automáticamente (`amd64` o `arm64`)
-4. Detecta el hostname para asignar el rol de Consul (web1=server, web2=agent)
-5. Crea servicios **systemd** para Consul y Node.js
-6. Inicia Consul, espera 6 segundos, luego inicia Node.js
-
----
+Aprovisionamiento de web1 y web2:
+1. Instala Node.js 20 LTS
+2. Descarga Consul (detecta arquitectura ARM64/AMD64 automáticamente)
+3. Copia config Consul según el rol (server en web1, agent en web2)
+4. Registra las 2 réplicas en Consul (`web-service-3000.json` y `web-service-3001.json`)
+5. Crea servicios systemd `nodeapp-3000` y `nodeapp-3001`
 
 ### `scripts/provision_haproxy.sh`
-
-Script de aprovisionamiento para la VM `haproxy`:
-
-1. Instala HAProxy via apt
-2. Copia `haproxy.cfg` y la página de error 503
-3. Valida la configuración con `haproxy -c -f`
-4. Inicia y habilita el servicio
+Aprovisionamiento de haproxy:
+1. Instala HAProxy
+2. Descarga consul-template (detecta arquitectura)
+3. Copia `haproxy.cfg.ctmpl` y `consul-template.hcl`
+4. Crea servicio systemd para consul-template
+5. consul-template arranca, consulta a Consul y genera `haproxy.cfg` dinámicamente
 
 ---
 
 ### `artillery/load-test.yml`
-
-Define los escenarios de prueba de carga. Usa la sintaxis de **Artillery 2.x** (`flow:` en lugar de `requests:`):
-
-- 4 fases de carga progresiva (5 → 20 → 50 → 100 req/s)
-- 2 escenarios con pesos: 80% peticiones a `/`, 20% a `/health`
-- Target: `http://localhost:8080` (el balanceador HAProxy)
+Prueba de carga con 4 fases progresivas (5→20→50→100 req/s). Sintaxis Artillery 2.x con `flow:`.
 
 ---
 
-## Notas técnicas importantes
+## Notas técnicas
+
+**¿Por qué `grep -oP` no funciona en Mac?**
+macOS usa BSD grep que no soporta `-P` (Perl regex). Usar `python3` para parsear el JSON de `/health`.
+
+**¿Qué es `consul reload`?**
+Si una réplica estuvo caída más de 1 minuto, Consul la desregistra automáticamente (`deregistercriticalserviceafter: 1m`). Al volver a levantar el proceso, hay que ejecutar `consul reload` para que Consul re-lea los archivos de definición y vuelva a registrar el servicio.
 
 **¿Por qué el navegador siempre muestra el mismo servidor?**
-Los navegadores usan HTTP keep-alive (conexión persistente), lo que hace que todas las peticiones de una misma pestaña vayan al mismo servidor. El Round Robin funciona a nivel de conexión TCP, no de petición HTTP. Usa `curl` en un loop para verificar correctamente el balanceo.
+HTTP keep-alive mantiene la conexión TCP abierta. El Round Robin opera por conexión, no por petición. Usar `curl` en loop para verificar el balanceo.
 
-**¿Por qué `Type=simple` en el servicio systemd de Consul?**
-`Type=notify` espera que el proceso envíe una señal de "listo" via `sd_notify`. En este entorno Vagrant, Consul no enviaba esa señal correctamente causando timeout. `Type=simple` funciona correctamente porque systemd considera el proceso como iniciado en cuanto arranca.
+**¿Por qué `Type=simple` en systemd para Consul?**
+`Type=notify` espera una señal `sd_notify` que Consul no enviaba correctamente en Vagrant, causando timeout. `Type=simple` arranca el proceso sin esperar esa señal.
 
-**¿Por qué se detecta la arquitectura en provision_web.sh?**
-Las VMs corren sobre un Mac Apple Silicon (ARM64). El binario de Consul `amd64` no es compatible. El script usa `dpkg --print-architecture` para detectar automáticamente si debe descargar `amd64` o `arm64`.
+**¿Por qué detectar arquitectura en los scripts?**
+Las VMs corren sobre Mac Apple Silicon (ARM64). Los binarios `amd64` no son compatibles. `dpkg --print-architecture` detecta automáticamente `arm64` o `amd64`.

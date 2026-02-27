@@ -1,4 +1,4 @@
-# Escalabilidad — Réplicas por nodo
+# Escalabilidad — Réplicas por nodo + consul-template
 
 **Microproyecto 1 | Computación en la Nube — Universidad Autónoma de Occidente**
 
@@ -24,8 +24,6 @@ En este proyecto se implementa **escalabilidad horizontal dentro de cada nodo**:
 
 Node.js es **monohilo**: un solo proceso utiliza únicamente 1 núcleo de CPU. Si la VM tiene 2 núcleos disponibles y solo hay 1 proceso corriendo, el 50% de la capacidad de cómputo queda sin usar.
 
-Al lanzar 2 réplicas por VM:
-
 ```
 Sin réplicas:         Con réplicas:
 ┌────────────┐        ┌────────────┐
@@ -39,20 +37,27 @@ Cada réplica es un proceso Node.js completamente independiente. Si una falla, l
 
 ---
 
-## Arquitectura con réplicas
+## Arquitectura con réplicas y consul-template
 
 ```
 Mac anfitrión
       │
       ▼ localhost:8080
-┌──────────────┐
-│   HAProxy    │  Round Robin entre 4 backends
-└──────┬───────┘
+┌──────────────────┐
+│   HAProxy        │  Round Robin — config generada por consul-template
+│   consul-template│◄─── consulta Consul cada vez que hay un cambio
+└──────┬───────────┘
        │
-       ├──► web1-r1  →  192.168.100.11:3000  (nodeapp-3000)
-       ├──► web1-r2  →  192.168.100.11:3001  (nodeapp-3001)
-       ├──► web2-r1  →  192.168.100.12:3000  (nodeapp-3000)
-       └──► web2-r2  →  192.168.100.12:3001  (nodeapp-3001)
+       ├──► web1-3000  →  192.168.100.11:3000  (nodeapp-3000)
+       ├──► web1-3001  →  192.168.100.11:3001  (nodeapp-3001)
+       ├──► web2-3000  →  192.168.100.12:3000  (nodeapp-3000)
+       └──► web2-3001  →  192.168.100.12:3001  (nodeapp-3001)
+
+Consul Server (web1:8500)
+  ├── service: web-3000 en web1  [passing ✓]
+  ├── service: web-3001 en web1  [passing ✓]
+  ├── service: web-3000 en web2  [passing ✓]
+  └── service: web-3001 en web2  [passing ✓]
 ```
 
 ---
@@ -61,18 +66,14 @@ Mac anfitrión
 
 ### 1. Variable de entorno `PORT` en Node.js
 
-El servidor lee el puerto desde la variable de entorno en lugar de tenerlo fijo:
-
 ```javascript
 // app/server.js
 const PORT = parseInt(process.env.PORT) || 3000;
 ```
 
-Esto permite lanzar el mismo binario en distintos puertos sin modificar el código.
+El mismo binario corre en distintos puertos según la variable de entorno que le pase systemd.
 
 ### 2. Dos servicios systemd por VM
-
-Cada VM tiene dos servicios systemd que lanzan el mismo `server.js` con distinto `PORT`:
 
 ```ini
 # /etc/systemd/system/nodeapp-3000.service
@@ -88,20 +89,36 @@ Environment=PORT=3001
 ExecStart=/usr/bin/node server.js
 ```
 
-### 3. Cuatro backends en HAProxy
+### 3. Dos registros de servicio en Consul por VM
 
-```
-# haproxy/haproxy.cfg
-backend web_servers
-    balance roundrobin
-    option  httpchk GET /health
-    server  web1-r1 192.168.100.11:3000 check inter 5s fall 2 rise 2
-    server  web1-r2 192.168.100.11:3001 check inter 5s fall 2 rise 2
-    server  web2-r1 192.168.100.12:3000 check inter 5s fall 2 rise 2
-    server  web2-r2 192.168.100.12:3001 check inter 5s fall 2 rise 2
+Cada réplica tiene su propio archivo de definición con `id` único:
+
+```json
+// consul/web-service-3000.json
+{ "service": { "id": "web-3000", "name": "web", "port": 3000,
+    "check": { "http": "http://localhost:3000/health", "interval": "5s" } } }
 ```
 
-HAProxy hace health checks a `/health` en cada réplica cada 5 segundos. Si una falla 2 veces seguidas, la saca del pool automáticamente.
+```json
+// consul/web-service-3001.json
+{ "service": { "id": "web-3001", "name": "web", "port": 3001,
+    "check": { "http": "http://localhost:3001/health", "interval": "5s" } } }
+```
+
+Consul hace health checks independientes a cada réplica.
+
+### 4. consul-template genera haproxy.cfg desde Consul
+
+consul-template corre en la VM `haproxy`, escucha el catálogo de Consul y regenera `haproxy.cfg` automáticamente cuando hay cambios:
+
+```
+# haproxy/haproxy.cfg.ctmpl  (fragmento clave)
+{{range service "web"}}
+    server {{.Node}}-{{.Port}} {{.Address}}:{{.Port}} check inter 5s fall 2 rise 2
+{{end}}
+```
+
+Esto genera las 4 líneas `server` dinámicamente con solo los backends **healthy** en Consul.
 
 ---
 
@@ -113,34 +130,22 @@ HAProxy hace health checks a `/health` en cada réplica cada 5 segundos. Si una 
 vagrant status
 ```
 
-Salida esperada:
-```
-web1     running (virtualbox)
-web2     running (virtualbox)
-haproxy  running (virtualbox)
-```
-
 ---
 
 ### Paso 2 — Verificar las 2 réplicas en web1
 
 ```bash
-vagrant ssh web1 -c "sudo systemctl status nodeapp-3000 --no-pager"
-vagrant ssh web1 -c "sudo systemctl status nodeapp-3001 --no-pager"
+vagrant ssh web1 -c "sudo systemctl status nodeapp-3000 nodeapp-3001 --no-pager"
 ```
-
-Ambos deben mostrar `Active: active (running)`.
-
-También confirmar que los dos puertos responden:
 
 ```bash
 vagrant ssh web1 -c "curl -s http://localhost:3000/health && echo && curl -s http://localhost:3001/health"
 ```
 
 Salida esperada:
-```
-{"status":"ok","host":"web1","ip":"192.168.100.11"}
-{"status":"ok","host":"web1","ip":"192.168.100.11"}
+```json
+{"status":"ok","host":"web1","ip":"192.168.100.11","port":3000}
+{"status":"ok","host":"web1","ip":"192.168.100.11","port":3001}
 ```
 
 ---
@@ -148,8 +153,7 @@ Salida esperada:
 ### Paso 3 — Verificar las 2 réplicas en web2
 
 ```bash
-vagrant ssh web2 -c "sudo systemctl status nodeapp-3000 --no-pager"
-vagrant ssh web2 -c "sudo systemctl status nodeapp-3001 --no-pager"
+vagrant ssh web2 -c "sudo systemctl status nodeapp-3000 nodeapp-3001 --no-pager"
 ```
 
 ```bash
@@ -158,9 +162,34 @@ vagrant ssh web2 -c "curl -s http://localhost:3000/health && echo && curl -s htt
 
 ---
 
-### Paso 4 — Ver los 4 backends en HAProxy
+### Paso 4 — Verificar los 4 servicios en Consul
 
-Abrir en el navegador:
+```bash
+vagrant ssh web1 -c "consul catalog services"
+vagrant ssh web1 -c "curl -s http://localhost:8500/v1/health/service/web | python3 -m json.tool"
+```
+
+Deben aparecer 4 instancias del servicio `web`, todas en estado `passing`.
+
+---
+
+### Paso 5 — Ver el haproxy.cfg generado dinámicamente
+
+```bash
+vagrant ssh haproxy -c "cat /etc/haproxy/haproxy.cfg" | grep "server w"
+```
+
+Salida esperada (generada por consul-template, no escrita a mano):
+```
+    server web1-3000 192.168.100.11:3000 check inter 5s fall 2 rise 2
+    server web1-3001 192.168.100.11:3001 check inter 5s fall 2 rise 2
+    server web2-3000 192.168.100.12:3000 check inter 5s fall 2 rise 2
+    server web2-3001 192.168.100.12:3001 check inter 5s fall 2 rise 2
+```
+
+---
+
+### Paso 6 — Ver los 4 backends en HAProxy stats
 
 ```
 http://localhost:8404/stats
@@ -168,74 +197,78 @@ http://localhost:8404/stats
 
 Usuario: `admin` | Contraseña: `admin`
 
-Deben aparecer **4 filas en verde**: `web1-r1`, `web1-r2`, `web2-r1`, `web2-r2`.
+Deben aparecer **4 filas en verde**.
 
 ---
 
-### Paso 5 — Demostrar el Round Robin entre las 4 réplicas
-
-Desde el Mac, ejecutar un loop de 8 peticiones:
+### Paso 7 — Demostrar el Round Robin entre las 4 réplicas
 
 ```bash
 for i in {1..8}; do
   echo -n "Peticion $i -> "
-  curl -s http://localhost:8080 | grep -oP 'desde <strong>\K[^<]+'
+  curl -s http://localhost:8080/health | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['host']+':'+str(d['port']))"
 done
 ```
 
-Salida esperada (las peticiones rotan entre las 4 réplicas):
+Salida esperada:
 ```
-Peticion 1 -> web1
-Peticion 2 -> web1
-Peticion 3 -> web2
-Peticion 4 -> web2
-Peticion 5 -> web1
-Peticion 6 -> web1
-Peticion 7 -> web2
-Peticion 8 -> web2
+Peticion 1 -> web1:3000
+Peticion 2 -> web1:3001
+Peticion 3 -> web2:3000
+Peticion 4 -> web2:3001
+Peticion 5 -> web1:3000
+Peticion 6 -> web1:3001
+Peticion 7 -> web2:3000
+Peticion 8 -> web2:3001
 ```
-
-> **Nota:** El hostname no incluye el puerto porque el HTML solo muestra el nombre del servidor. Lo que importa es que HAProxy está distribuyendo entre los 4 procesos — visible en la columna "Sessions" de la GUI de stats.
 
 ---
 
-### Paso 6 — Simular la caída de una réplica (alta disponibilidad)
-
-Detener solo la réplica en puerto 3000 de web1:
+### Paso 8 — Simular la caída de una réplica
 
 ```bash
+# Detener una sola replica
 vagrant ssh web1 -c "sudo systemctl stop nodeapp-3000"
 ```
 
-Esperar ~10 segundos y volver a hacer peticiones:
+Esperar ~15 segundos para que Consul detecte el fallo, luego:
+
+```bash
+# consul-template debe haber eliminado web1-3000 del config
+vagrant ssh haproxy -c "cat /etc/haproxy/haproxy.cfg" | grep "server w"
+```
+
+Solo deben aparecer **3 servers**. El trafico sigue fluyendo:
 
 ```bash
 for i in {1..6}; do
   echo -n "Peticion $i -> "
-  curl -s http://localhost:8080 | grep -oP 'desde <strong>\K[^<]+'
+  curl -s http://localhost:8080/health | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['host']+':'+str(d['port']))"
 done
 ```
 
-El sistema sigue respondiendo con las **3 réplicas restantes** (`web1-r2`, `web2-r1`, `web2-r2`). En HAProxy stats, `web1-r1` aparece en rojo.
-
-Restaurar:
+**Restaurar la réplica:**
 
 ```bash
 vagrant ssh web1 -c "sudo systemctl start nodeapp-3000"
+
+# Si estuvo caida mas de 1 minuto, Consul la desregistro automaticamente.
+# Hay que recargar el agente para que vuelva a registrarse:
+vagrant ssh web1 -c "consul reload"
 ```
 
-Tras ~10 segundos, `web1-r1` vuelve a aparecer en verde y recibe tráfico nuevamente.
+Tras ~10 segundos `web1-3000` vuelve al config y al balanceo.
 
 ---
 
-### Paso 7 — Prueba de carga Artillery con las 4 réplicas activas
+### Paso 9 — Prueba de carga Artillery con las 4 réplicas activas
 
 ```bash
 cd ~/compunube/microproyecto1
 artillery run artillery/load-test.yml
 ```
 
-Con 4 réplicas activas, el sistema puede absorber hasta **100 req/s** (fase pico) distribuyendo la carga entre los 4 procesos Node.js. Observar en la GUI de HAProxy cómo los contadores de sesiones suben en los 4 backends simultáneamente.
+Abrir **http://localhost:8404/stats** en paralelo para ver los contadores de sesiones subir en los 4 backends simultáneamente.
 
 ---
 
@@ -244,7 +277,9 @@ Con 4 réplicas activas, el sistema puede absorber hasta **100 req/s** (fase pic
 | Concepto | Cómo se demuestra |
 |----------|-------------------|
 | Escalabilidad horizontal | 2 réplicas por VM, 4 backends en total |
-| Tolerancia a fallos | Caída de 1 réplica no interrumpe el servicio |
-| Distribución de carga | Round Robin visible en HAProxy stats |
-| Configuración dinámica | Variable `PORT` en systemd, mismo binario distintos puertos |
-| Health checks automáticos | HAProxy detecta caídas y las excluye del pool |
+| Aprovechamiento de CPU | Cada réplica corre en un proceso/núcleo independiente |
+| Integración HAProxy-Consul | consul-template genera haproxy.cfg desde el catalogo de Consul |
+| Tolerancia a fallos | Caída de 1 réplica → consul-template la elimina del config automáticamente |
+| Distribución de carga | Round Robin visible por réplica con `python3` parseando `/health` |
+| Auto-recuperación | Al restaurar una réplica vuelve al pool sin intervención manual en HAProxy |
+| Desregistro automático | Si una réplica cae >1 min, Consul la borra del catalogo (`consul reload` para re-registrar) |
